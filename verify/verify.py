@@ -3,8 +3,11 @@
 Aggregates, via its exit code:
   1. code tests   -- runs the unit-test suite;
   2. build        -- this container only runs if the image built;
-  3. API smoke    -- creates a course, races concurrent competing fractions,
-                     restarts the API container and verifies persisted state.
+  3. API smoke    -- creates a course, races concurrent competing fractions;
+  4. corrections  -- replaces an accepted fraction, races concurrent
+                     corrections, reactivates and re-completes the course;
+  5. persistence  -- restarts the API container and verifies persisted
+                     state plus delivery/correction replay.
 
 Exits 0 only if every check passes.
 """
@@ -86,7 +89,7 @@ def restart_app_container():
 
 
 def run_unit_tests():
-    print("== stage 1/3: unit tests ==", flush=True)
+    print("== stage 1/4: unit tests ==", flush=True)
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -98,7 +101,7 @@ def run_unit_tests():
 
 
 def smoke_tests(course):
-    print("== stage 2/3: API smoke (create / race / retry / limits) ==", flush=True)
+    print("== stage 2/4: API smoke (create / race / retry / limits) ==", flush=True)
     base = f"/api/courses/{course}"
 
     status, body = api("PUT", base, {"channels": {"A": "3.0", "B": "2.5"}})
@@ -190,11 +193,124 @@ def smoke_tests(course):
                         "increments": {"A": "2.0", "B": "2.5"}})
     check("post-complete replay of original -> 200 same body",
           status == 200 and body == fill_body, f"{status} {body}")
-    return fill_body
+    return win_id, winner, fill_body
 
 
-def persistence_tests(course, fill_body):
-    print("== stage 3/3: restart and persistence ==", flush=True)
+def correction_tests(course, win_id, winner_body):
+    print("== stage 3/4: corrections (replace / replay / race / reactivate) ==",
+          flush=True)
+    base = f"/api/courses/{course}"
+
+    # The course is complete (revision 2, A=3, B=2.5). Correcting fill-1
+    # undoes its {A: 2, B: 2.5} and substitutes {A: 1.5, B: 1.5}.
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-1", "deliveryId": "fill-1",
+                        "expectedRevision": 2,
+                        "increments": {"A": "1.5", "B": "1.5"}})
+    check("correction accepted -> 200, complete course active again at revision 3",
+          status == 200 and body.get("revision") == 3
+          and body.get("status") == "active"
+          and body.get("cumulative", {}).get("A") == "2.5"
+          and body.get("cumulative", {}).get("B") == "1.5", f"{status} {body}")
+    correction_body = body
+
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-1", "deliveryId": "fill-1",
+                        "expectedRevision": 2,
+                        "increments": {"A": "1.5", "B": "1.5"}})
+    check("same correctionId + same content replays first result",
+          status == 200 and body == correction_body, f"{status} {body}")
+
+    status, _ = api("POST", base + "/corrections",
+                    {"correctionId": "corr-1", "deliveryId": "fill-1",
+                     "expectedRevision": 2,
+                     "increments": {"A": "1.0", "B": "1.5"}})
+    check("same correctionId, different content -> 409", status == 409, f"{status}")
+
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-2", "deliveryId": "fill-1",
+                        "expectedRevision": 3, "increments": {"A": "1.0"}})
+    check("second correction of same delivery -> 409",
+          status == 409 and body.get("error") == "delivery_already_corrected",
+          f"{status} {body}")
+
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-3", "deliveryId": "no-such",
+                        "expectedRevision": 3, "increments": {"A": "1.0"}})
+    check("correction of unknown delivery -> 409",
+          status == 409 and body.get("error") == "delivery_not_found",
+          f"{status} {body}")
+
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-4", "deliveryId": win_id,
+                        "expectedRevision": 2, "increments": {"A": "0.5"}})
+    check("stale revision correction -> 409",
+          status == 409 and body.get("error") == "stale_revision", f"{status} {body}")
+
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-5", "deliveryId": win_id,
+                        "expectedRevision": 3, "increments": {"A": "10"}})
+    check("overflowing correction -> 409 prescription_exceeded",
+          status == 409 and body.get("error") == "prescription_exceeded",
+          f"{status} {body}")
+
+    status, body = api("POST", base + "/corrections",
+                       {"correctionId": "corr-6", "deliveryId": win_id,
+                        "expectedRevision": 3, "increments": {"ZZ": "1"}})
+    check("correction with unknown channel -> 409",
+          status == 409 and body.get("error") == "unknown_channel", f"{status} {body}")
+
+    status, body = api("GET", base)
+    check("rejected corrections wrote nothing (revision 3, A=2.5, B=1.5)",
+          status == 200 and body.get("revision") == 3
+          and body["channels"]["A"]["cumulative"] == "2.5"
+          and body["channels"]["B"]["cumulative"] == "1.5", f"{status} {body}")
+
+    # Concurrent corrections of the same fraction: exactly one is accepted.
+    statuses = []
+    barrier = threading.Barrier(8)
+
+    def race(i):
+        barrier.wait()
+        s, _ = api("POST", base + "/corrections",
+                   {"correctionId": f"race-corr-{i}", "deliveryId": win_id,
+                    "expectedRevision": 3, "increments": {"A": "0.5"}})
+        statuses.append(s)
+
+    threads = [threading.Thread(target=race, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("concurrent corrections: exactly one accepted",
+          statuses.count(200) == 1 and statuses.count(409) == 7,
+          f"statuses: {statuses}")
+
+    status, body = api("GET", base)
+    check("winning correction applied exactly once (revision 4, A=2, B=1.5)",
+          status == 200 and body.get("revision") == 4
+          and body["channels"]["A"]["cumulative"] == "2"
+          and body["channels"]["B"]["cumulative"] == "1.5", f"{status} {body}")
+
+    # The corrected delivery's own id still replays its pre-correction response.
+    status, body = api("POST", base + "/deliveries",
+                       {"deliveryId": win_id, "expectedRevision": 0,
+                        "increments": {"A": "1.0"}})
+    check("original deliveryId retry returns pre-correction response",
+          status == 200 and body == winner_body, f"{status} {body}")
+
+    # The reactivated course accepts new fractions and completes again.
+    status, body = api("POST", base + "/deliveries",
+                       {"deliveryId": "fill-2", "expectedRevision": 4,
+                        "increments": {"A": "1.0", "B": "1.0"}})
+    check("course completes again at revision 5",
+          status == 200 and body.get("status") == "complete"
+          and body.get("revision") == 5, f"{status} {body}")
+    return correction_body
+
+
+def persistence_tests(course, fill_body, correction_body):
+    print("== stage 4/4: restart and persistence ==", flush=True)
     if not restart_app_container():
         check("restart app container via docker socket", False)
         return
@@ -205,19 +321,33 @@ def persistence_tests(course, fill_body):
     check("API healthy after restart", True)
 
     status, body = api("GET", f"/api/courses/{course}")
-    check("state persisted across restart (complete, revision 2)",
-          status == 200 and body.get("status") == "complete" and body.get("revision") == 2
+    check("state persisted across restart (complete, revision 5)",
+          status == 200 and body.get("status") == "complete" and body.get("revision") == 5
           and body["channels"]["A"]["cumulative"] == "3"
           and body["channels"]["B"]["cumulative"] == "2.5", f"{status} {body}")
 
     status, body = api("POST", f"/api/courses/{course}/deliveries",
                        {"deliveryId": "fill-1", "expectedRevision": 1,
                         "increments": {"A": "2.0", "B": "2.5"}})
-    check("delivery replay survives restart (no double count)",
+    check("delivery replay survives restart (pre-correction body, no double count)",
           status == 200 and body == fill_body, f"{status} {body}")
 
+    status, body = api("POST", f"/api/courses/{course}/corrections",
+                       {"correctionId": "corr-1", "deliveryId": "fill-1",
+                        "expectedRevision": 2,
+                        "increments": {"A": "1.5", "B": "1.5"}})
+    check("correction replay survives restart (no double undo)",
+          status == 200 and body == correction_body, f"{status} {body}")
+
+    status, body = api("POST", f"/api/courses/{course}/corrections",
+                       {"correctionId": "corr-9", "deliveryId": "fill-1",
+                        "expectedRevision": 5, "increments": {"A": "1.0"}})
+    check("already-corrected delivery still rejected after restart",
+          status == 409 and body.get("error") == "delivery_already_corrected",
+          f"{status} {body}")
+
     status, body = api("POST", f"/api/courses/{course}/deliveries",
-                       {"deliveryId": "late-2", "expectedRevision": 2,
+                       {"deliveryId": "late-2", "expectedRevision": 5,
                         "increments": {"A": "0.1"}})
     check("completed course still rejects new deliveries after restart",
           status == 409 and body.get("error") == "course_complete", f"{status} {body}")
@@ -239,15 +369,17 @@ def main():
     if RUN_UNIT_TESTS:
         run_unit_tests()
     else:
-        print("== stage 1/3: unit tests (skipped, RUN_UNIT_TESTS=0) ==", flush=True)
+        print("== stage 1/4: unit tests (skipped, RUN_UNIT_TESTS=0) ==", flush=True)
 
     check("API healthy", wait_healthy())
     course = f"verify-{int(time.time())}"
-    fill_body = {}
+    win_id, winner_body, fill_body, correction_body = "race-0", {}, {}, {}
     if not FAILURES:
-        fill_body = smoke_tests(course)
+        win_id, winner_body, fill_body = smoke_tests(course)
     if not FAILURES:
-        persistence_tests(course, fill_body)
+        correction_body = correction_tests(course, win_id, winner_body)
+    if not FAILURES:
+        persistence_tests(course, fill_body, correction_body)
     else:
         print("skipping remaining stages because of earlier failures", flush=True)
 

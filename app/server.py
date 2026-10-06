@@ -15,6 +15,10 @@ Consistency model
 * ``expectedRevision`` implements optimistic concurrency: exactly one of a
   set of competing submissions is accepted and each acceptance increments
   the revision by exactly one.
+* Corrections atomically undo an accepted delivery's increments and apply
+  their replacements; the delivery's stored first response is never
+  rewritten, each delivery can be corrected at most once, and a correction
+  may return a ``complete`` course to ``active``.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ MAX_CHANNELS = 16
 MAX_CHANNEL_NAME_LEN = 64
 MAX_COURSE_ID_LEN = 128
 MAX_DELIVERY_ID_LEN = 128
+MAX_CORRECTION_ID_LEN = 128
 MAX_BODY_BYTES = 64 * 1024
 
 # Canonical positive decimal: no leading zeros, optional fraction.
@@ -57,9 +62,20 @@ CREATE TABLE IF NOT EXISTS deliveries (
     course_id    TEXT NOT NULL REFERENCES courses(course_id),
     delivery_id  TEXT NOT NULL,
     request_hash TEXT NOT NULL,
+    increments   TEXT NOT NULL,
     response     TEXT NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (course_id, delivery_id)
+);
+CREATE TABLE IF NOT EXISTS corrections (
+    course_id     TEXT NOT NULL REFERENCES courses(course_id),
+    correction_id TEXT NOT NULL,
+    delivery_id   TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    response      TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (course_id, correction_id),
+    UNIQUE (course_id, delivery_id)
 );
 """
 
@@ -143,6 +159,35 @@ def validate_delivery_payload(payload):
     return (delivery_id, expected, parsed), None
 
 
+def validate_correction_payload(payload):
+    """Validate a correction body.
+
+    Returns ((correction_id, delivery_id, expected, increments), error).
+    """
+    if not isinstance(payload, dict):
+        return None, "body must be a JSON object"
+    correction_id = payload.get("correctionId")
+    if not isinstance(correction_id, str) or not correction_id \
+            or len(correction_id) > MAX_CORRECTION_ID_LEN:
+        return None, "'correctionId' must be a non-empty string of at most 128 characters"
+    delivery_id = payload.get("deliveryId")
+    if not isinstance(delivery_id, str) or not delivery_id or len(delivery_id) > MAX_DELIVERY_ID_LEN:
+        return None, "'deliveryId' must be a non-empty string of at most 128 characters"
+    expected = payload.get("expectedRevision")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+        return None, "'expectedRevision' must be a non-negative integer"
+    increments = payload.get("increments")
+    if not isinstance(increments, dict) or not increments:
+        return None, "'increments' must name at least one channel with a positive dose"
+    parsed = {}
+    for name, dose in increments.items():
+        d = parse_positive_decimal(dose)
+        if d is None:
+            return None, f"invalid replacement dose for channel {name!r}: must be a positive decimal string"
+        parsed[name] = d
+    return (correction_id, delivery_id, expected, parsed), None
+
+
 def _hash_payload(obj) -> str:
     blob = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()
@@ -165,6 +210,17 @@ class CourseStore:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # Databases created before corrections existed lack the
+            # deliveries.increments column; add it. Rows predating the
+            # migration keep NULL and are rejected as uncorrectable.
+            cols = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(deliveries)")
+            }
+            if "increments" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE deliveries ADD COLUMN increments TEXT"
+                )
 
     def close(self):
         with self._lock:
@@ -349,9 +405,172 @@ class CourseStore:
                     },
                 }
                 cur.execute(
-                    "INSERT INTO deliveries(course_id, delivery_id, request_hash, response) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO deliveries(course_id, delivery_id, request_hash, "
+                    "increments, response) VALUES (?, ?, ?, ?, ?)",
                     (course_id, delivery_id, request_hash,
+                     json.dumps({k: canonical_decimal(v)
+                                 for k, v in sorted(increments.items())},
+                                sort_keys=True),
+                     json.dumps(body, sort_keys=True)),
+                )
+                cur.execute("COMMIT")
+                return 200, body
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def submit_correction(self, course_id: str, correction_id: str,
+                          delivery_id: str, expected_revision: int,
+                          increments: dict):
+        """Atomically replace an accepted delivery's increments.
+
+        Undoes the target delivery's original increments and applies the
+        replacement increments instead, all-or-nothing; the delivery's own
+        stored response is left untouched so its retries keep replaying the
+        pre-correction result. Returns (http_status, body).
+        """
+        request_hash = _hash_payload({
+            "correctionId": correction_id,
+            "deliveryId": delivery_id,
+            "expectedRevision": expected_revision,
+            "increments": {k: canonical_decimal(v) for k, v in sorted(increments.items())},
+        })
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                course = cur.execute(
+                    "SELECT revision FROM courses WHERE course_id=?", (course_id,)
+                ).fetchone()
+                if course is None:
+                    cur.execute("ROLLBACK")
+                    return 404, {"error": "course_not_found",
+                                 "message": f"course {course_id!r} does not exist"}
+                revision = course[0]
+
+                prior = cur.execute(
+                    "SELECT request_hash, response FROM corrections "
+                    "WHERE course_id=? AND correction_id=?",
+                    (course_id, correction_id),
+                ).fetchone()
+                if prior is not None:
+                    cur.execute("ROLLBACK")
+                    if prior[0] == request_hash:
+                        # Same id, same content: replay the first result.
+                        return 200, json.loads(prior[1])
+                    return 409, {
+                        "error": "correction_conflict",
+                        "message": f"correctionId {correction_id!r} already used "
+                                   "with different content",
+                    }
+
+                target = cur.execute(
+                    "SELECT increments FROM deliveries "
+                    "WHERE course_id=? AND delivery_id=?",
+                    (course_id, delivery_id),
+                ).fetchone()
+                if target is None:
+                    cur.execute("ROLLBACK")
+                    return 409, {
+                        "error": "delivery_not_found",
+                        "message": f"delivery {delivery_id!r} was not accepted "
+                                   f"for course {course_id!r}",
+                    }
+                if target[0] is None:
+                    cur.execute("ROLLBACK")
+                    return 409, {
+                        "error": "delivery_not_correctable",
+                        "message": f"delivery {delivery_id!r} predates correction "
+                                   "support and cannot be undone safely",
+                    }
+
+                already = cur.execute(
+                    "SELECT 1 FROM corrections WHERE course_id=? AND delivery_id=?",
+                    (course_id, delivery_id),
+                ).fetchone()
+                if already is not None:
+                    cur.execute("ROLLBACK")
+                    return 409, {
+                        "error": "delivery_already_corrected",
+                        "message": f"delivery {delivery_id!r} has already been corrected",
+                    }
+
+                if expected_revision != revision:
+                    cur.execute("ROLLBACK")
+                    return 409, {
+                        "error": "stale_revision",
+                        "message": f"expected revision {expected_revision} but "
+                                   f"current revision is {revision}",
+                        "revision": revision,
+                    }
+
+                rows = cur.execute(
+                    "SELECT channel, prescription, cumulative FROM channels "
+                    "WHERE course_id=?",
+                    (course_id,),
+                ).fetchall()
+                prescription = {r[0]: Decimal(r[1]) for r in rows}
+                cumulative = {r[0]: Decimal(r[2]) for r in rows}
+
+                unknown = sorted(n for n in increments if n not in prescription)
+                if unknown:
+                    cur.execute("ROLLBACK")
+                    return 409, {
+                        "error": "unknown_channel",
+                        "message": f"channels not defined for this course: {unknown}",
+                        "channels": unknown,
+                    }
+
+                original = {k: Decimal(v) for k, v in json.loads(target[0]).items()}
+                new_cumulative = dict(cumulative)
+                for name, dose in original.items():
+                    new_cumulative[name] = new_cumulative[name] - dose
+                for name, dose in increments.items():
+                    new_cumulative[name] = new_cumulative[name] + dose
+                changed = sorted(set(original) | set(increments))
+                exceeded = sorted(
+                    n for n in changed if new_cumulative[n] > prescription[n]
+                )
+                if exceeded:
+                    cur.execute("ROLLBACK")
+                    return 409, {
+                        "error": "prescription_exceeded",
+                        "message": f"cumulative dose would exceed prescription "
+                                   f"for channels: {exceeded}",
+                        "channels": exceeded,
+                    }
+
+                # All checks passed: undo + replace as one write.
+                for name in changed:
+                    cur.execute(
+                        "UPDATE channels SET cumulative=? WHERE course_id=? AND channel=?",
+                        (canonical_decimal(new_cumulative[name]), course_id, name),
+                    )
+                new_revision = revision + 1
+                new_status = (
+                    "complete"
+                    if all(new_cumulative[n] == prescription[n] for n in prescription)
+                    else "active"
+                )
+                cur.execute(
+                    "UPDATE courses SET revision=?, status=? WHERE course_id=?",
+                    (new_revision, new_status, course_id),
+                )
+                body = {
+                    "courseId": course_id,
+                    "correctionId": correction_id,
+                    "deliveryId": delivery_id,
+                    "revision": new_revision,
+                    "status": new_status,
+                    "cumulative": {
+                        n: canonical_decimal(new_cumulative[n])
+                        for n in sorted(new_cumulative)
+                    },
+                }
+                cur.execute(
+                    "INSERT INTO corrections(course_id, correction_id, delivery_id, "
+                    "request_hash, response) VALUES (?, ?, ?, ?, ?)",
+                    (course_id, correction_id, delivery_id, request_hash,
                      json.dumps(body, sort_keys=True)),
                 )
                 cur.execute("COMMIT")
@@ -367,6 +586,7 @@ class CourseStore:
 
 COURSE_RE = re.compile(r"^/api/courses/([^/]+)$")
 DELIVERIES_RE = re.compile(r"^/api/courses/([^/]+)/deliveries$")
+CORRECTIONS_RE = re.compile(r"^/api/courses/([^/]+)/corrections$")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -435,20 +655,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         m = DELIVERIES_RE.match(self.path)
-        if not m:
-            return self._send(404, {"error": "not_found", "message": "unknown route"})
-        course_id = unquote(m.group(1))
-        payload, err = self._read_json()
-        if err:
-            return self._send(*err)
-        parsed, error = validate_delivery_payload(payload)
-        if error:
-            return self._send(422, {"error": "invalid_delivery", "message": error})
-        delivery_id, expected, increments = parsed
-        status, body = self.store.submit_delivery(
-            course_id, delivery_id, expected, increments
-        )
-        self._send(status, body)
+        if m:
+            course_id = unquote(m.group(1))
+            payload, err = self._read_json()
+            if err:
+                return self._send(*err)
+            parsed, error = validate_delivery_payload(payload)
+            if error:
+                return self._send(422, {"error": "invalid_delivery", "message": error})
+            delivery_id, expected, increments = parsed
+            status, body = self.store.submit_delivery(
+                course_id, delivery_id, expected, increments
+            )
+            return self._send(status, body)
+        m = CORRECTIONS_RE.match(self.path)
+        if m:
+            course_id = unquote(m.group(1))
+            payload, err = self._read_json()
+            if err:
+                return self._send(*err)
+            parsed, error = validate_correction_payload(payload)
+            if error:
+                return self._send(422, {"error": "invalid_correction", "message": error})
+            correction_id, delivery_id, expected, increments = parsed
+            status, body = self.store.submit_correction(
+                course_id, correction_id, delivery_id, expected, increments
+            )
+            return self._send(status, body)
+        self._send(404, {"error": "not_found", "message": "unknown route"})
 
 
 def run(port=None, db_path=None):
