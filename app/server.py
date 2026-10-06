@@ -15,6 +15,10 @@ Consistency model
 * ``expectedRevision`` implements optimistic concurrency: exactly one of a
   set of competing submissions is accepted and each acceptance increments
   the revision by exactly one.
+* Corrections (``POST .../corrections``) atomically revoke an accepted
+  delivery's increments and substitute new ones. ``correctionId`` has the
+  same replay semantics as ``deliveryId``; a delivery can be corrected at
+  most once, and a correction may reopen a ``complete`` course as ``active``.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ MAX_CHANNELS = 16
 MAX_CHANNEL_NAME_LEN = 64
 MAX_COURSE_ID_LEN = 128
 MAX_DELIVERY_ID_LEN = 128
+MAX_CORRECTION_ID_LEN = 128
 MAX_BODY_BYTES = 64 * 1024
 
 # Canonical positive decimal: no leading zeros, optional fraction.
@@ -58,10 +63,31 @@ CREATE TABLE IF NOT EXISTS deliveries (
     delivery_id  TEXT NOT NULL,
     request_hash TEXT NOT NULL,
     response     TEXT NOT NULL,
+    increments   TEXT,
+    corrected_by TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (course_id, delivery_id)
 );
+CREATE TABLE IF NOT EXISTS corrections (
+    course_id     TEXT NOT NULL REFERENCES courses(course_id),
+    correction_id TEXT NOT NULL,
+    delivery_id   TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    response      TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (course_id, correction_id),
+    UNIQUE (course_id, delivery_id)
+);
 """
+
+# Columns added after the initial release (SQLite has no "ADD COLUMN IF NOT
+# EXISTS"), applied lazily to databases created by older versions.
+_MIGRATIONS = {
+    "deliveries": [
+        ("increments", "TEXT"),
+        ("corrected_by", "TEXT"),
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +169,36 @@ def validate_delivery_payload(payload):
     return (delivery_id, expected, parsed), None
 
 
+def validate_correction_payload(payload):
+    """Validate a corrections POST body.
+
+    Returns ((correction_id, delivery_id, expected, increments), error).
+    """
+    if not isinstance(payload, dict):
+        return None, "body must be a JSON object"
+    correction_id = payload.get("correctionId")
+    if not isinstance(correction_id, str) or not correction_id \
+            or len(correction_id) > MAX_CORRECTION_ID_LEN:
+        return None, "'correctionId' must be a non-empty string of at most 128 characters"
+    delivery_id = payload.get("deliveryId")
+    if not isinstance(delivery_id, str) or not delivery_id \
+            or len(delivery_id) > MAX_DELIVERY_ID_LEN:
+        return None, "'deliveryId' must be a non-empty string of at most 128 characters"
+    expected = payload.get("expectedRevision")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+        return None, "'expectedRevision' must be a non-negative integer"
+    increments = payload.get("increments")
+    if not isinstance(increments, dict) or not increments:
+        return None, "'increments' must name at least one known channel with a positive dose"
+    parsed = {}
+    for name, dose in increments.items():
+        d = parse_positive_decimal(dose)
+        if d is None:
+            return None, f"invalid replacement dose for channel {name!r}: must be a positive decimal string"
+        parsed[name] = d
+    return (correction_id, delivery_id, expected, parsed), None
+
+
 def _hash_payload(obj) -> str:
     blob = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()
@@ -165,6 +221,19 @@ class CourseStore:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self):
+        """Add columns/tables introduced after the first release."""
+        for table, columns in _MIGRATIONS.items():
+            existing = {
+                r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            for name, decl in columns:
+                if name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                    )
 
     def close(self):
         with self._lock:
