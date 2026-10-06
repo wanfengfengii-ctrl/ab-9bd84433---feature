@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    container_name: rtqc-app
+    environment:
+      PORT: 8000
+      DB_PATH: /data/app.db
+    volumes:
+      - rtqc-data:/data
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    container_name: rtqc-verify
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      API_URL: http://app:8000
+      APP_CONTAINER: rtqc-app
+      RUN_UNIT_TESTS: "1"
+    volumes:
+      # Needed so the verify service can restart the app container and
+      # confirm that accepted deliveries survive a service restart.
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "-m", "verify.verify"]
+    restart: "no"
+
+volumes:
+  rtqc-data:
